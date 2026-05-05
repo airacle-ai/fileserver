@@ -1,0 +1,7 @@
+# Don't commit uploaded data
+data/*
+!data/.gitkeep
+*.log
+__pycache__/
+*.pyc
+.env
