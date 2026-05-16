@@ -1,7 +1,9 @@
 # Don't commit uploaded data
 data/*
 !data/.gitkeep
+.upload_chunks/
 *.log
 __pycache__/
 *.pyc
 .env
+server.pid
