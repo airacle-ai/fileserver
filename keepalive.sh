@@ -6,8 +6,20 @@ set -euo pipefail
 
 PORT=41011
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG="$DIR/server.log"
-PIDFILE="$DIR/server.pid"
+
+# Storage lives on sensei-fs (persists across pod restarts).
+# If the sensei-fs (Lustre) shared quota fills up and uploads start 500ing with
+# "Disk quota exceeded", switch to localssd by exporting before launch:
+#   FILESERVER_DATA_DIR=/mnt/localssd/fileserver_data ./keepalive.sh
+# (localssd is fast + quota-free, but wiped on pod restart.)
+export FILESERVER_DATA_DIR="${FILESERVER_DATA_DIR:-$DIR/data}"
+export FILESERVER_CHUNK_DIR="${FILESERVER_CHUNK_DIR:-$DIR/.upload_chunks}"
+# Logs go to localssd regardless — if the quota is full, even writing the log
+# fails and the server can't start.
+LOG_DIR="/mnt/localssd/fileserver_logs"
+mkdir -p "$FILESERVER_DATA_DIR" "$LOG_DIR"
+LOG="$LOG_DIR/server.log"
+PIDFILE="$LOG_DIR/server.pid"
 
 is_running() {
   # Prefer pidfile check, fall back to port scan

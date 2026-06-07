@@ -19,13 +19,19 @@ app = Flask(__name__)
 # Allow single request up to 200MB (chunk size is 50MB on client; header overhead safe margin)
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024
 
-# Storage root — everything lives under here
-BASE_DIR = Path(__file__).parent / "data"
-BASE_DIR.mkdir(exist_ok=True)
+# Storage root — everything lives under here.
+# Override with FILESERVER_DATA_DIR env var. Defaults to ./data next to app.py.
+# NOTE: sensei-fs (Lustre) has a shared per-project quota that can fill up and
+# cause 500s on upload (writes fail with "Disk quota exceeded"). Point this at
+# /mnt/localssd/ to avoid the quota (fast, but lost on pod restart).
+_default_base = Path(__file__).parent / "data"
+BASE_DIR = Path(os.environ.get("FILESERVER_DATA_DIR", str(_default_base)))
+BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Temp dir for chunked uploads
-CHUNK_DIR = Path(__file__).parent / ".upload_chunks"
-CHUNK_DIR.mkdir(exist_ok=True)
+# Temp dir for chunked uploads — keep next to the data dir (same filesystem,
+# so finalize can move/copy without crossing a quota boundary).
+CHUNK_DIR = Path(os.environ.get("FILESERVER_CHUNK_DIR", str(BASE_DIR.parent / ".upload_chunks")))
+CHUNK_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def safe_path(rel: str) -> Path:
@@ -467,36 +473,73 @@ function hideProgress() {
   setTimeout(() => { document.getElementById('progressArea').style.display = 'none'; }, 800);
 }
 
-// 50 MB chunk size — safely under Cloudflare's 100 MB per-request limit
-const CHUNK_SIZE = 50 * 1024 * 1024;
-const LARGE_FILE_THRESHOLD = 80 * 1024 * 1024;  // switch to chunked mode above this
+// 8 MB chunks — small enough to survive the colligo.dev / Cloudflare proxy,
+// which truncates large single POST bodies (caused 400s on ~50MB files).
+const CHUNK_SIZE = 8 * 1024 * 1024;
+// Almost everything chunks now; single-shot only for tiny files (<8MB) where
+// the proxy never complains and per-chunk overhead isn't worth it.
+const LARGE_FILE_THRESHOLD = 8 * 1024 * 1024;
+const CHUNK_RETRIES = 3;  // retry each chunk on transient network/proxy errors
 
 function genUploadId() {
   return 'u' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
 }
 
-async function uploadSingle(file, rel, dest) {
+// POST via XHR so we get real upload-progress events (fetch() can't report them).
+function xhrUpload(url, fd, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url);
+    if (onProgress && xhr.upload) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) onProgress(e.loaded, e.total);
+      };
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve(xhr.responseText);
+      else reject(new Error(`HTTP ${xhr.status}`));
+    };
+    xhr.onerror = () => reject(new Error('network error'));
+    xhr.ontimeout = () => reject(new Error('timeout'));
+    xhr.send(fd);
+  });
+}
+
+async function uploadSingle(file, rel, dest, onProgress) {
   const fd = new FormData();
   fd.append('file', file, rel);
   fd.append('dest', dest);
   fd.append('rel', rel);
-  const r = await fetch('/upload', { method: 'POST', body: fd });
-  if (!r.ok) throw new Error(`upload failed: ${r.status}`);
+  await xhrUpload('/upload', fd, onProgress);
 }
 
-async function uploadChunked(file, rel, dest, onChunkProgress) {
+async function uploadChunked(file, rel, dest, onByteProgress) {
   const uploadId = genUploadId();
   const total = Math.ceil(file.size / CHUNK_SIZE);
   for (let i = 0; i < total; i++) {
     const start = i * CHUNK_SIZE;
-    const blob = file.slice(start, Math.min(start + CHUNK_SIZE, file.size));
-    const fd = new FormData();
-    fd.append('upload_id', uploadId);
-    fd.append('index', String(i));
-    fd.append('chunk', blob);
-    const r = await fetch('/upload-chunk', { method: 'POST', body: fd });
-    if (!r.ok) throw new Error(`chunk ${i} failed: ${r.status}`);
-    if (onChunkProgress) onChunkProgress(i + 1, total);
+    const end = Math.min(start + CHUNK_SIZE, file.size);
+    const blob = file.slice(start, end);
+    let lastErr;
+    let ok = false;
+    for (let attempt = 0; attempt < CHUNK_RETRIES; attempt++) {
+      try {
+        const fd = new FormData();
+        fd.append('upload_id', uploadId);
+        fd.append('index', String(i));
+        fd.append('chunk', blob);
+        await xhrUpload('/upload-chunk', fd, (loaded) => {
+          if (onByteProgress) onByteProgress(start + loaded, file.size);
+        });
+        ok = true;
+        break;
+      } catch (e) {
+        lastErr = e;
+        await new Promise(r => setTimeout(r, 500 * (attempt + 1)));  // backoff
+      }
+    }
+    if (!ok) throw new Error(`chunk ${i + 1}/${total} failed: ${lastErr ? lastErr.message : 'unknown'}`);
+    if (onByteProgress) onByteProgress(end, file.size);
   }
   const r = await fetch('/upload-finalize', {
     method: 'POST',
@@ -525,17 +568,18 @@ async function uploadFiles(files, dest) {
 
   for (const file of files) {
     const rel = file.webkitRelativePath || file.name;
+    // Byte-level progress callback — works for both single and chunked paths.
+    const onBytes = (loaded, fileTotal) => {
+      const fileFrac = fileTotal ? loaded / fileTotal : 0;
+      const overall = ((done + fileFrac) / total) * 100;
+      setProgress(overall);
+      label.textContent = `${done+1}/${total} — ${rel} (${humanSize(loaded)} / ${humanSize(file.size)})`;
+    };
     try {
       if (file.size > LARGE_FILE_THRESHOLD) {
-        await uploadChunked(file, rel, dest, (i, n) => {
-          const fileFrac = i / n;
-          const overall = ((done + fileFrac) / total) * 100;
-          setProgress(overall);
-          label.textContent = `${done+1}/${total} — ${rel} (chunk ${i}/${n}, ${humanSize(file.size)})`;
-        });
+        await uploadChunked(file, rel, dest, onBytes);
       } else {
-        label.textContent = `${done+1}/${total} — ${rel} (${humanSize(file.size)})`;
-        await uploadSingle(file, rel, dest);
+        await uploadSingle(file, rel, dest, onBytes);
       }
     } catch (e) {
       hideProgress();
